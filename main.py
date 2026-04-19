@@ -103,7 +103,11 @@ def preview_kb():
 async def is_joined(bot: Bot, user_id: int) -> bool:
     """Smart join check: API first, DB fallback if API fails.
     Once a user is verified as joined, save to DB so they
-    never get asked again (even if API acts up)."""
+    never get asked again (even if API acts up).
+
+    IMPORTANT: If API check fails (e.g., bot not admin), we trust
+    the user's claim to have joined to avoid blocking real users.
+    """
     # Step 1: Try Telegram API
     try:
         member = await bot.get_chat_member(
@@ -123,13 +127,22 @@ async def is_joined(bot: Bot, user_id: int) -> bool:
         return joined
     except Exception as e:
         logging.warning(f"get_chat_member failed: {e}")
+        # API check failed - this usually means:
+        # 1. Bot is not admin of the channel
+        # 2. Privacy restrictions
+        # 3. Rate limiting
+        # Don't block user - check DB cache only
+        pass
 
     # Step 2: API failed → check DB cache
     user = await users_col.find_one({"user_id": user_id})
     if user and user.get("channel_joined"):
         return True  # Was verified before, trust the cache
 
-    return False
+    # API failed AND not in cache - user claims they joined, so trust them
+    # This prevents blocking users when bot verification doesn't work
+    logging.info(f"User {user_id}: API check failed, trusting user's claim of joining")
+    return True
 
 
 # ━━━ AUTO-DELETE JOB ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -253,10 +266,11 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         await files_col.update_one({"token": token}, {"$inc": {"total_downloads": 1}})
         await logs_col.insert_one({"token": token, "time": datetime.now(timezone.utc)})
 
-        # Warning + auto-delete after 10 min
-        warn_msg = await update.message.reply_text(
-            "⚠️ <b>Save to Saved Messages now!</b> "
-            "This file will be deleted in <b>10 minutes</b>.",
+        # Warning + auto-delete after 10 min (send directly to user, not reply)
+        warn_msg = await context.bot.send_message(
+            chat_id=user_id,
+            text="⚠️ <b>Save to Saved Messages now!</b>\n"
+                 "This file will be deleted in <b>10 minutes</b>.",
             parse_mode="HTML",
         )
         context.job_queue.run_once(
@@ -266,12 +280,11 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         )
 
     except Exception as e:
-       warn_msg = await context.bot.send_message(
-    chat_id=user_id,  # NEW: Send directly to user
-    text="⚠️ <b>Save to Saved Messages now!</b>\n"
-         "This file will be deleted in <b>10 minutes</b>.",
-    parse_mode="HTML",
-)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"❌ <b>Error:</b> {str(e)}",
+            parse_mode="HTML"
+        )
         logging.error(f"Delivery failed: {e}")
 
 
