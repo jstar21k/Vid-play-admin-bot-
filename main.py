@@ -10,7 +10,7 @@ from telegram import (
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters
 )
 from telegram.constants import ChatMemberStatus
 
@@ -58,6 +58,12 @@ CAPTIONS = [
     "🫣 Someone's in big trouble after this leak 💀",
 ]
 
+# ━━━ PENDING POST STATE (in-memory) ━━━━━━━━━━━━━━━━━━━━━━━━━
+# When admin uploads to storage, bot auto-asks for thumbnail.
+# This dict holds the pending post info until flow completes.
+_pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
+
+
 # ━━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def generate_token():
@@ -84,17 +90,45 @@ def admin_kb():
     ])
 
 
+def preview_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Send Now", callback_data="pc_send"),
+         InlineKeyboardButton("🔄 New Caption", callback_data="pc_rot")],
+        [InlineKeyboardButton("🖼 New Thumb", callback_data="pc_rethumb"),
+         InlineKeyboardButton("❌ Cancel", callback_data="pc_cancel")],
+    ])
+
+
 async def is_joined(bot: Bot, user_id: int) -> bool:
-    """Check if user has joined the force-join channel."""
+    """Smart join check: API first, DB fallback if API fails.
+    Once a user is verified as joined, save to DB so they
+    never get asked again (even if API acts up)."""
+    # Step 1: Try Telegram API
     try:
-        member = await bot.get_chat_member(chat_id=f"@{FORCE_JOIN_CHANNEL}", user_id=user_id)
-        return member.status in (
+        member = await bot.get_chat_member(
+            chat_id=f"@{FORCE_JOIN_CHANNEL}", user_id=user_id
+        )
+        joined = member.status in (
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
         )
-    except Exception:
-        return False
+        # Save result to DB (cache for next time)
+        await users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {"channel_joined": joined}},
+            upsert=True,
+        )
+        return joined
+    except Exception as e:
+        logging.warning(f"get_chat_member failed: {e}")
+
+    # Step 2: API failed → check DB cache
+    user = await users_col.find_one({"user_id": user_id})
+    if user and user.get("channel_joined"):
+        return True  # Was verified before, trust the cache
+
+    return False
 
 
 # ━━━ AUTO-DELETE JOB ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -120,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         upsert=True,
     )
 
-    # ── /start token → deliver file ──
+    # ── /start <token> → deliver file with force-join check ──
     if context.args:
         token = context.args[0]
         file_data = await files_col.find_one({"token": token})
@@ -129,7 +163,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid or expired link.")
             return
 
-        # Force-join check
         joined = await is_joined(context.bot, user.id)
         if not joined:
             kb = InlineKeyboardMarkup([
@@ -146,20 +179,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['pending_token'] = token
             return
 
+        # Save joined status in DB so we don't ask again
+        await users_col.update_one(
+            {"user_id": user.id},
+            {"$set": {"channel_joined": True}},
+            upsert=True,
+        )
         await deliver_file(update, context, file_data)
         return
 
-    # ── Normal /start ──
+    # ── Normal /start (no token) ──
     if user.id == ADMIN_USER_ID:
         await update.message.reply_text(
             "💎 <b>JSTAR PRO ADMIN PANEL</b>\n\n"
-            "/post — Create channel post\n"
-            "/recent — View last 5 uploads",
+            "📊 Use buttons below or just upload\n"
+            "a file to storage to auto-post.",
             reply_markup=admin_kb(),
             parse_mode="HTML",
         )
         return
 
+    # Check DB cache first (instant, no API call)
+    user_data = await users_col.find_one({"user_id": user.id})
+    if user_data and user_data.get("channel_joined"):
+        await update.message.reply_text(
+            "👋 Welcome back!\n\nSend me a link to get your file.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Not cached → do full API check
     joined = await is_joined(context.bot, user.id)
     if joined:
         await update.message.reply_text(
@@ -179,6 +228,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
+
+# ━━━ DELIVER FILE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_data: dict):
     """Send file to user, update stats, schedule auto-delete."""
@@ -201,7 +252,7 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         await files_col.update_one({"token": token}, {"$inc": {"total_downloads": 1}})
         await logs_col.insert_one({"token": token, "time": datetime.now(timezone.utc)})
 
-        # Warning + auto-delete
+        # Warning + auto-delete after 10 min
         warn_msg = await update.message.reply_text(
             "⚠️ <b>Save to Saved Messages now!</b> "
             "This file will be deleted in <b>10 minutes</b>.",
@@ -220,26 +271,52 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         logging.error(f"Delivery failed: {e}")
 
 
-# ━━━ COMMAND: /recent ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━ FORCE JOIN CHECK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def recent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
+async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """After user clicks 'I've Joined', verify and deliver file."""
+    q = update.callback_query
+    await q.answer()
+
+    user_id = update.effective_user.id
+    pending_token = context.user_data.get('pending_token')
+
+    joined = await is_joined(context.bot, user_id)
+    if not joined:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
+            [InlineKeyboardButton("✅ I've Joined", callback_data="check_join")],
+        ])
+        await q.edit_message_text(
+            "❌ <b>You haven't joined yet!</b>\n\n"
+            "Join the channel first, then click below:",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
         return
 
-    files = await files_col.find().sort("created_at", -1).limit(5).to_list(5)
-    if not files:
-        await update.message.reply_text("📂 No files yet.", parse_mode="HTML")
-        return
+    # User is joined → save to DB so never asked again
+    await users_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"channel_joined": True}},
+        upsert=True,
+    )
 
-    text = "📂 <b>Last 5 Uploads:</b>\n\n"
-    for i, f in enumerate(files, 1):
-        name = f.get('file_name', '?')[:40]
-        dur = format_duration(f.get('video_duration'))
-        dl = f.get('total_downloads', 0)
-        link = f"{GATEWAY_URL}?token={f['token']}"
-        text += f"<b>{i}.</b> <code>{name}</code>\n   ⏱ {dur} │ 📥 {dl}\n   <code>{link}</code>\n\n"
+    if pending_token:
+        file_data = await files_col.find_one({"token": pending_token})
+        if file_data:
+            await q.edit_message_text(
+                "✅ <b>Verified!</b> Delivering your file...",
+                parse_mode="HTML",
+            )
+            await deliver_file(update, context, file_data)
+            context.user_data.pop('pending_token', None)
+            return
 
-    await update.message.reply_text(text, parse_mode="HTML")
+    await q.edit_message_text(
+        "✅ <b>Welcome!</b>\n\nNow send me your link to get the file.",
+        parse_mode="HTML",
+    )
 
 
 # ━━━ ADMIN CALLBACK BUTTONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -251,9 +328,13 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "stats":
         total_links = await files_col.count_documents({})
         total_users = await users_col.count_documents({})
-        agg = await files_col.aggregate([{"$group": {"_id": None, "dl": {"$sum": "$total_downloads"}}}]).to_list(1)
+        agg = await files_col.aggregate(
+            [{"$group": {"_id": None, "dl": {"$sum": "$total_downloads"}}}]
+        ).to_list(1)
         total_dl = agg[0]['dl'] if agg else 0
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         today_dl = await logs_col.count_documents({"time": {"$gte": today}})
 
         await query.edit_message_text(
@@ -282,9 +363,12 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ Refreshed!", reply_markup=admin_kb())
 
 
-# ━━━ AUTO-LINK ON STORAGE UPLOAD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  STORAGE UPLOAD → AUTO-LINK + ASK THUMBNAIL
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """File uploaded to storage channel → save to DB, send link, ask for thumbnail."""
     post = update.channel_post
     if not post or post.chat_id != STORAGE_CHANNEL_ID:
         return
@@ -293,13 +377,21 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not att or isinstance(att, list):
         return
 
-    file_name = getattr(att, 'file_name', 'New_Upload')
-    video_duration = 0
+    # ── Extract file name (fix: video objects may not have file_name) ──
     if post.video:
+        file_name = getattr(post.video, 'file_name', None) or "New_Video"
         video_duration = post.video.duration or 0
     elif post.document:
+        file_name = getattr(post.document, 'file_name', None) or "New_File"
         video_duration = getattr(post.document, 'duration', None) or 0
+    elif post.audio:
+        file_name = getattr(post.audio, 'file_name', None) or "New_Audio"
+        video_duration = getattr(post.audio, 'duration', None) or 0
+    else:
+        file_name = "New_Upload"
+        video_duration = 0
 
+    # ── Save to DB ──
     token = generate_token()
     await files_col.insert_one({
         "file_name": file_name,
@@ -311,213 +403,171 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     link = f"{GATEWAY_URL}?token={token}"
+
+    # ── Send link to admin ──
     try:
         await context.bot.send_message(
             chat_id=ADMIN_USER_ID,
             text=(
-                f"🚀 <b>Auto-Link!</b>\n\n"
+                f"🚀 <b>Auto-Link Created!</b>\n\n"
                 f"📁 <code>{file_name}</code>\n"
                 f"⏱ <code>{format_duration(video_duration)}</code>\n"
                 f"🔗 <code>{link}</code>\n\n"
-                f"💡 /post to create channel post"
+                f"📸 <b>Now send me a thumbnail</b> to create the post!\n"
+                f"(or send /skip to post without thumbnail)"
             ),
             parse_mode="HTML",
         )
     except Exception:
         logging.error("Failed to notify admin.")
+        return
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  /post CONVERSATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SEL, THUMB, CONFIRM = range(3)
-
-
-async def post_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
-        return ConversationHandler.END
-
-    files = await files_col.find().sort("created_at", -1).limit(5).to_list(5)
-    if not files:
-        await update.message.reply_text("❌ No files found. Upload to storage first.")
-        return ConversationHandler.END
-
-    kb = []
-    for f in files:
-        name = f.get('file_name', '?')[:30]
-        dur = format_duration(f.get('video_duration'))
-        kb.append([InlineKeyboardButton(f"{name} ({dur})", callback_data=f"ps_{f['token']}")])
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="pc_cancel")])
-
-    await update.message.reply_text(
-        "📝 <b>POST — Step 1/3</b>\n\n📂 Select file:",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="HTML",
-    )
-    return SEL
-
-
-async def post_sel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "pc_cancel":
-        await q.edit_message_text("❌ Cancelled.", parse_mode="HTML")
-        return ConversationHandler.END
-
-    token = q.data[3:]  # remove "ps_"
-    fd = await files_col.find_one({"token": token})
-    if not fd:
-        await q.edit_message_text("❌ File not found.", parse_mode="HTML")
-        return ConversationHandler.END
-
-    context.user_data['_post'] = {
-        'name': fd['file_name'],
-        'token': fd['token'],
-        'duration': format_duration(fd.get('video_duration')),
+    # ── Set pending post state — waiting for thumbnail ──
+    _pending_post[ADMIN_USER_ID] = {
+        'token': token,
+        'name': file_name,
+        'duration': format_duration(video_duration),
     }
 
-    await q.edit_message_text(
-        "📝 <b>POST — Step 2/3</b>\n\n"
-        f"📂 <code>{fd['file_name'][:40]}</code>\n"
-        f"⏱ <code>{context.user_data['_post']['duration']}</code>\n\n"
-        "📸 Send me a <b>thumbnail</b>.",
-        parse_mode="HTML",
-    )
-    return THUMB
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ADMIN SENDS THUMBNAIL (photo in private chat)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def post_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pd = context.user_data.get('_post')
-    if not pd:
-        await update.message.reply_text("❌ Session expired. /post again")
-        return ConversationHandler.END
+async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sent a photo — check if there's a pending post waiting for thumbnail."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+
+    pending = _pending_post.get(user_id)
+    if not pending:
+        return  # No pending post, ignore
 
     if not update.message.photo:
-        await update.message.reply_text("❌ Send a <b>photo</b> as thumbnail.", parse_mode="HTML")
-        return THUMB
+        return  # Not a photo
 
-    pd['thumb'] = update.message.photo[-1].file_id
-    pd['caption'] = secrets.choice(CAPTIONS)
+    # ── Save thumbnail, generate caption, show preview ──
+    pending['thumb'] = update.message.photo[-1].file_id
+    pending['caption'] = secrets.choice(CAPTIONS)
 
-    link = f"{GATEWAY_URL}?token={pd['token']}"
-    cap = f"{pd['caption']}\n\n⏱ Duration: {pd['duration']}"
+    link = f"{GATEWAY_URL}?token={pending['token']}"
+    cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Send Now", callback_data="pc_send"),
-         InlineKeyboardButton("🔄 New Caption", callback_data="pc_rot")],
-        [InlineKeyboardButton("🖼 New Thumbnail", callback_data="pc_rethumb"),
-         InlineKeyboardButton("❌ Cancel", callback_data="pc_cancel")],
-    ])
-
-    await update.message.reply_text("👀 <b>Preview:</b>", parse_mode="HTML")
-    await update.message.reply_photo(
-        photo=pd['thumb'], caption=cap, parse_mode="HTML", reply_markup=kb
+    preview_msg = await update.message.reply_photo(
+        photo=pending['thumb'],
+        caption=cap,
+        parse_mode="HTML",
+        reply_markup=preview_kb(),
     )
-    return CONFIRM
+    pending['preview_msg_id'] = preview_msg.message_id
+    pending['preview_chat_id'] = preview_msg.chat_id
 
 
-async def post_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ━━━ /skip COMMAND — skip thumbnail, post with caption only ━━━
+
+async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+
+    pending = _pending_post.get(user_id)
+    if not pending:
+        await update.message.reply_text("❌ No pending post to skip.")
+        return
+
+    link = f"{GATEWAY_URL}?token={pending['token']}"
+    cap = f"{secrets.choice(CAPTIONS)}\n\n⏱ Duration: {pending['duration']}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=link)]])
+
+    await context.bot.send_message(
+        chat_id=ADMIN_USER_ID,
+        text=f"📝 <b>Post (no thumbnail):</b>\n\n{cap}",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await update.message.reply_text(
+        "✅ <b>Done!</b> Forward above to your channel.",
+        parse_mode="HTML",
+    )
+    _pending_post.pop(user_id, None)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  POST PREVIEW CALLBACKS (Send Now / Rotate / New Thumb / Cancel)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    pd = context.user_data.get('_post')
-    if not pd:
-        return ConversationHandler.END
+    user_id = update.effective_user.id
 
+    pending = _pending_post.get(user_id)
+    if not pending:
+        await q.answer("❌ Session expired.", show_alert=True)
+        return
+
+    # ── SEND NOW ──
     if q.data == "pc_send":
-        link = f"{GATEWAY_URL}?token={pd['token']}"
-        cap = f"{pd['caption']}\n\n⏱ Duration: {pd['duration']}"
+        link = f"{GATEWAY_URL}?token={pending['token']}"
+        cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Watch Now", url=link)]])
 
-        await context.bot.send_photo(
-            chat_id=update.effective_user.id,
-            photo=pd['thumb'], caption=cap, parse_mode="HTML", reply_markup=kb,
-        )
-        await q.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text="✅ <b>Done!</b> Forward above to your channel.",
-            parse_mode="HTML",
-        )
-        context.user_data.pop('_post', None)
-        return ConversationHandler.END
-
-    elif q.data == "pc_rot":
-        pd['caption'] = secrets.choice([c for c in CAPTIONS if c != pd['caption']])
-        cap = f"{pd['caption']}\n\n⏱ Duration: {pd['duration']}"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Send Now", callback_data="pc_send"),
-             InlineKeyboardButton("🔄 New Caption", callback_data="pc_rot")],
-            [InlineKeyboardButton("🖼 New Thumbnail", callback_data="pc_rethumb"),
-             InlineKeyboardButton("❌ Cancel", callback_data="pc_cancel")],
-        ])
+        # Remove buttons from preview
         try:
-            await q.edit_message_caption(cap, parse_mode="HTML", reply_markup=kb)
+            await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        return CONFIRM
 
+        # Send final post to admin
+        await context.bot.send_photo(
+            chat_id=ADMIN_USER_ID,
+            photo=pending['thumb'],
+            caption=cap,
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="✅ <b>Done!</b> Forward the post above to your channel.",
+            parse_mode="HTML",
+        )
+        _pending_post.pop(user_id, None)
+
+    # ── NEW CAPTION ──
+    elif q.data == "pc_rot":
+        pending['caption'] = secrets.choice(
+            [c for c in CAPTIONS if c != pending['caption']]
+        )
+        cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
+        try:
+            await q.edit_message_caption(
+                caption=cap,
+                parse_mode="HTML",
+                reply_markup=preview_kb(),
+            )
+        except Exception:
+            pass
+
+    # ── NEW THUMBNAIL ──
     elif q.data == "pc_rethumb":
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text("🖼 Send a <b>new thumbnail</b>:", parse_mode="HTML")
-        return THUMB
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text(
+            "🖼 Send me a <b>new thumbnail</b>:\n(or /skip to post without)",
+            parse_mode="HTML",
+        )
 
+    # ── CANCEL ──
     elif q.data == "pc_cancel":
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await q.message.reply_text("❌ Cancelled.", parse_mode="HTML")
-        context.user_data.pop('_post', None)
-        return ConversationHandler.END
-
-
-async def post_cancel_fb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_USER_ID and context.user_data.get('_post'):
-        context.user_data.pop('_post', None)
-        await update.message.reply_text("❌ Cancelled. /post to start again.", parse_mode="HTML")
-    return ConversationHandler.END
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  FORCE JOIN CHECK — callback button from inline
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """After user clicks 'I've Joined' button, verify and deliver."""
-    q = update.callback_query
-    await q.answer()
-
-    user_id = update.effective_user.id
-    pending_token = context.user_data.get('pending_token')
-
-    joined = await is_joined(context.bot, user_id)
-    if not joined:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📺 Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}"),
-            InlineKeyboardButton("✅ I've Joined", callback_data="check_join"),
-        ]])
-        await q.edit_message_text(
-            "❌ <b>You haven't joined yet!</b>\n\n"
-            "Join the channel first, then click the button below:",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
-        return
-
-    # User joined — deliver file
-    if pending_token:
-        file_data = await files_col.find_one({"token": pending_token})
-        if file_data:
-            await q.edit_message_text("✅ <b>Verified!</b> Delivering your file...", parse_mode="HTML")
-            await deliver_file(update, context, file_data)
-            context.user_data.pop('pending_token', None)
-            return
-
-    await q.edit_message_text(
-        "✅ <b>Welcome!</b>\n\nNow send me your link to get the file.",
-        parse_mode="HTML",
-    )
+        await q.message.reply_text("❌ Post cancelled.", parse_mode="HTML")
+        _pending_post.pop(user_id, None)
 
 
 # ━━━ MAIN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -527,29 +577,26 @@ if __name__ == '__main__':
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("recent", recent_cmd))
-
-    # Admin callbacks
-    app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^(stats|status|refresh)$"))
+    app.add_handler(CommandHandler("skip", skip_thumb))
 
     # Force-join verify callback
     app.add_handler(CallbackQueryHandler(force_join_check, pattern="^check_join$"))
 
-    # /post conversation
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("post", post_start)],
-        states={
-            SEL: [CallbackQueryHandler(post_sel_cb, pattern=r"^ps_|^pc_cancel$")],
-            THUMB: [MessageHandler(filters.PHOTO, post_thumb)],
-            CONFIRM: [CallbackQueryHandler(post_confirm, pattern=r"^pc_")],
-        },
-        fallbacks=[CommandHandler("cancel", post_cancel_fb)],
-        allow_reentry=True,
+    # Admin panel buttons (stats/status/refresh)
+    app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^(stats|status|refresh)$"))
+
+    # Post preview buttons (send/rotate/rethumb/cancel)
+    app.add_handler(CallbackQueryHandler(post_callback, pattern="^pc_"))
+
+    # Admin sends photo → check if pending post needs thumbnail
+    app.add_handler(MessageHandler(
+        filters.Chat(ADMIN_USER_ID) & filters.PHOTO & ~filters.UpdateType.CHANNEL_POST,
+        on_admin_photo,
     ))
 
-    # Storage channel auto-link
+    # Storage channel upload → auto-link + ask thumbnail
     app.add_handler(MessageHandler(
-        filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL),
+        filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL | filters.AUDIO),
         on_storage_upload,
     ))
 
