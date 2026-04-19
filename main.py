@@ -266,9 +266,12 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
         )
 
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ <b>Error:</b> {str(e)}", parse_mode="HTML"
-        )
+       warn_msg = await context.bot.send_message(
+    chat_id=user_id,  # NEW: Send directly to user
+    text="⚠️ <b>Save to Saved Messages now!</b>\n"
+         "This file will be deleted in <b>10 minutes</b>.",
+    parse_mode="HTML",
+)
         logging.error(f"Delivery failed: {e}")
 
 
